@@ -36,9 +36,14 @@
 #include "hw/net/cadence_gem.h"
 #include "hw/cpu/a9mpcore.h"
 
+#define MAX_CPUS 2
+
 #define NUM_SPI_FLASHES 4
 #define NUM_QSPI_FLASHES 2
 #define NUM_QSPI_BUSSES 2
+
+#define OCM_BASE (0xfffc0000)
+#define OCM_SIZE (256 << 10)
 
 #define FLASH_SIZE (64 * 1024 * 1024)
 #define FLASH_SECTOR_SIZE (128 * 1024)
@@ -47,6 +52,19 @@
 
 #define MPCORE_PERIPHBASE 0xF8F00000
 #define ZYNQ_BOARD_MIDR 0x413FC090
+
+/* Entry point for secondary CPU. Zynq Linux SMP protocol is to just reset
+ * the secondary to unpen, so any infinite loop will do the trick. Use a WFI
+ * loop as that will cause the emulated CPU to halt (and remove itself from
+ * the work queue pending an interrupt that never comes).
+ */
+static uint32_t zynq_smpboot[] = {
+    0xe320f003, /* wfi */
+    0xeafffffd, /* b       <b wfi> */
+};
+
+/* Put SMP bootloard up top of 0CM */
+#define SMP_BOOT_ADDR ((uint64_t)OCM_BASE + OCM_SIZE - sizeof(zynq_smpboot))
 
 static const int dma_irqs[8] = {
     46, 47, 48, 49, 72, 73, 74, 75
@@ -73,8 +91,7 @@ static const int dma_irqs[8] = {
     0xe3401000 + ARMV7_IMM16(extract32((val), 16, 16)), /* movt r1 ... */ \
     0xe5801000 + (addr)
 
-static void zynq_write_board_setup(ARMCPU *cpu,
-                                   const struct arm_boot_info *info)
+static void zynq_write_board_setup(ARMCPU *cpu, const struct arm_boot_info *info)
 {
     int n;
     uint32_t board_setup_blob[] = {
@@ -87,8 +104,24 @@ static void zynq_write_board_setup(ARMCPU *cpu,
     for (n = 0; n < ARRAY_SIZE(board_setup_blob); n++) {
         board_setup_blob[n] = tswap32(board_setup_blob[n]);
     }
-    rom_add_blob_fixed("board-setup", board_setup_blob,
-                       sizeof(board_setup_blob), BOARD_SETUP_ADDR);
+    rom_add_blob_fixed("board-setup", board_setup_blob,sizeof(board_setup_blob), BOARD_SETUP_ADDR);
+}
+
+static void zynq_write_secondary_boot(ARMCPU *cpu, const struct arm_boot_info *info)
+{
+    int n;
+
+    for (n = 0; n < ARRAY_SIZE(zynq_smpboot); n++) {
+        zynq_smpboot[n] = tswap32(zynq_smpboot[n]);
+    }
+    rom_add_blob_fixed("smpboot", zynq_smpboot, sizeof(zynq_smpboot), SMP_BOOT_ADDR);
+}
+
+static void zynq_reset_secondary(ARMCPU *cpu, const struct arm_boot_info *info)
+{
+    CPUARMState *env = &cpu->env;
+
+    env->regs[15] = info->smp_loader_start;
 }
 
 static struct arm_boot_info zynq_binfo = {};
@@ -161,7 +194,9 @@ static void zynq_init(MachineState *machine)
     const char *kernel_filename = machine->kernel_filename;
     const char *kernel_cmdline = machine->kernel_cmdline;
     const char *initrd_filename = machine->initrd_filename;
-    ARMCPU *cpu;
+    //ARMCPU *cpu;
+    ObjectClass * cpu_oc;
+    ARMCPU *cpu[MAX_CPUS];
     MemoryRegion *address_space_mem = get_system_memory();
     MemoryRegion *ext_ram = g_new(MemoryRegion, 1);
     MemoryRegion *ocm_ram = g_new(MemoryRegion, 1);
@@ -172,21 +207,27 @@ static void zynq_init(MachineState *machine)
     qemu_irq pic[64];
     int n;
 
-    cpu = ARM_CPU(object_new(machine->cpu_type));
+    //cpu = ARM_CPU(object_new(machine->cpu_type));
 
-    /* By default A9 CPUs have EL3 enabled.  This board does not
-     * currently support EL3 so the CPU EL3 property is disabled before
-     * realization.
-     */
-    if (object_property_find(OBJECT(cpu), "has_el3", NULL)) {
-        object_property_set_bool(OBJECT(cpu), false, "has_el3", &error_fatal);
-    }
+    cpu_oc = cpu_class_by_name(TYPE_ARM_CPU, machine->cpu_model);
+     for (n = 0; n < MAX_CPUS; n++) {
+        cpu[n] = ARM_CPU(object_new(object_class_get_name(cpu_oc)));
 
-    object_property_set_int(OBJECT(cpu), ZYNQ_BOARD_MIDR, "midr",
-                            &error_fatal);
-    object_property_set_int(OBJECT(cpu), MPCORE_PERIPHBASE, "reset-cbar",
-                            &error_fatal);
-    object_property_set_bool(OBJECT(cpu), true, "realized", &error_fatal);
+        /* By default A9 CPUs have EL3 enabled.  This board does not
+         * currently support EL3 so the CPU EL3 property is disabled before
+         * realization.
+         */
+        if (object_property_find(OBJECT(cpu), "has_el3", NULL)) {
+            object_property_set_bool(OBJECT(cpu), false, "has_el3", &error_fatal);
+        }
+
+        //object_property_set_int(OBJECT(cpu), ZYNQ_BOARD_MIDR, "midr",  &error_fatal);
+        //object_property_set_int(OBJECT(cpu), MPCORE_PERIPHBASE, "reset-cbar", &error_fatal);
+        //object_property_set_bool(OBJECT(cpu), true, "realized", &error_fatal);
+
+        object_property_set_int(OBJECT(cpu[n]), MPCORE_PERIPHBASE, "reset-cbar", &error_fatal);
+        object_property_set_bool(OBJECT(cpu[n]), true, "realized", &error_fatal);
+     }
 
     /* max 2GB ram */
     if (ram_size > 0x80000000) {
@@ -218,12 +259,16 @@ static void zynq_init(MachineState *machine)
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, 0xF8000000);
 
     dev = qdev_create(NULL, TYPE_A9MPCORE_PRIV);
-    qdev_prop_set_uint32(dev, "num-cpu", 1);
+    // qdev_prop_set_uint32(dev, "num-cpu", 1);
+    qdev_prop_set_uint32(dev, "num-cpu", MAX_CPUS);
     qdev_init_nofail(dev);
     busdev = SYS_BUS_DEVICE(dev);
     sysbus_mmio_map(busdev, 0, MPCORE_PERIPHBASE);
-    sysbus_connect_irq(busdev, 0,
-                       qdev_get_gpio_in(DEVICE(cpu), ARM_CPU_IRQ));
+    //sysbus_connect_irq(busdev, 0, qdev_get_gpio_in(DEVICE(cpu), ARM_CPU_IRQ));
+
+    for (n = 0; n < MAX_CPUS; n++) {
+        sysbus_connect_irq(busdev, n, qdev_get_gpio_in(DEVICE(cpu[n]), ARM_CPU_IRQ));
+    }
 
     for (n = 0; n < 64; n++) {
         pic[n] = qdev_get_gpio_in(dev, n);
@@ -304,7 +349,11 @@ static void zynq_init(MachineState *machine)
     zynq_binfo.kernel_filename = kernel_filename;
     zynq_binfo.kernel_cmdline = kernel_cmdline;
     zynq_binfo.initrd_filename = initrd_filename;
-    zynq_binfo.nb_cpus = 1;
+    //zynq_binfo.nb_cpus = 1;
+    zynq_binfo.nb_cpus = MAX_CPUS;
+    zynq_binfo.write_secondary_boot = zynq_write_secondary_boot;
+    zynq_binfo.secondary_cpu_reset_hook = zynq_reset_secondary;
+    zynq_binfo.smp_loader_start = SMP_BOOT_ADDR;
     zynq_binfo.board_id = 0xd32;
     zynq_binfo.loader_start = 0;
     zynq_binfo.board_setup_addr = BOARD_SETUP_ADDR;
@@ -317,7 +366,8 @@ static void zynq_machine_init(MachineClass *mc)
 {
     mc->desc = "Xilinx Zynq Platform Baseboard for Cortex-A9";
     mc->init = zynq_init;
-    mc->max_cpus = 1;
+    //mc->max_cpus = 1;
+    mc->max_cpus = MAX_CPUS;
     mc->no_sdcard = 1;
     mc->ignore_memory_transaction_failures = true;
     mc->default_cpu_type = ARM_CPU_TYPE_NAME("cortex-a9");
